@@ -22,6 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, KernelConfig
 NUM_WARMUP = 10
 NUM_RUNS = 50
 SEQ_LEN = 1024
+DTYPE = torch.bfloat16  # switch to torch.float32 to check numerical precision
 
 # model_id = "michaelbenayoun/qwen3-tiny-4kv-heads-4layers-random"
 model_id = "Qwen/Qwen3-0.6B"
@@ -32,7 +33,7 @@ inputs = tokenizer("Hello, how are you?", return_tensors="pt", padding="max_leng
 # --- baseline: plain model, no fusion ---
 print("=" * 60)
 print("Loading baseline model (no fusion)...")
-baseline = AutoModelForCausalLM.from_pretrained(model_id, use_kernels=False)
+baseline = AutoModelForCausalLM.from_pretrained(model_id, use_kernels=False, torch_dtype=DTYPE)
 baseline = baseline.to("neuron")
 baseline.eval()
 inputs = {k: v.to(baseline.device) for k, v in inputs.items()}
@@ -56,7 +57,7 @@ kernel_config = KernelConfig(
 )
 
 fused_model = AutoModelForCausalLM.from_pretrained(
-    model_id, use_kernels=True, kernel_config=kernel_config, device_map="neuron"
+    model_id, use_kernels=True, kernel_config=kernel_config, torch_dtype=DTYPE, device_map="neuron"
 )
 fused_model = fused_model.to("neuron")
 fused_model.eval()
@@ -65,6 +66,24 @@ print(fused_model)
 with torch.no_grad():
     fused_out = fused_model(**inputs).logits
 print("Fused output shape:", fused_out.shape)
+
+# --- weight check ---
+print("=" * 60)
+print("Checking weights match between baseline and fused model...")
+for i, (bl_layer, fused_layer) in enumerate(zip(baseline.model.layers, fused_model.model.layers)):
+    bl_norm   = bl_layer.post_attention_layernorm
+    fused_mod = fused_layer.post_attention_layernorm
+
+    diffs = {
+        "norm_weight": (bl_norm.weight.cpu()                - fused_mod.norm_weight.cpu()).abs().max().item(),
+        "gate_proj":   (bl_layer.mlp.gate_proj.weight.cpu() - fused_mod.gate_proj.weight.cpu()).abs().max().item(),
+        "up_proj":     (bl_layer.mlp.up_proj.weight.cpu()   - fused_mod.up_proj.weight.cpu()).abs().max().item(),
+        "down_proj":   (bl_layer.mlp.down_proj.weight.cpu() - fused_mod.down_proj.weight.cpu()).abs().max().item(),
+    }
+    any_mismatch = any(v > 0 for v in diffs.values())
+    if any_mismatch:
+        print(f"  Layer {i} MISMATCH: { {k: v for k, v in diffs.items() if v > 0} }")
+print("Weight check done.")
 
 # --- compare ---
 print("=" * 60)
