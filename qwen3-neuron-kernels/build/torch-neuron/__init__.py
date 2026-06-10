@@ -1,19 +1,19 @@
 import torch
 import torch.nn as nn
 
-from transformers import Concatenate, WeightConverter, WeightRenaiming
+from transformers.core_model_loading import WeightRenaming
 
-from nkilib.core.mlp import mlp as nki_mlp
+from nkilib.core.mlp.mlp import mlp as nki_mlp
 from nkilib.core.utils.common_types import ActFnType, NormType, QuantizationType
 
 
 class NeuronRMSNormMLPLayout(nn.Module):
     conversion_mapping = [
-        WeightRenaiming(
+        WeightRenaming(
             source_patterns=r"model.layers.(\d+).post_attention_layernorm.weight",
             target_patterns=r"model.layers.\1.post_attention_layernorm.norm_weight",
         ),
-        WeightRenaiming(
+        WeightRenaming(
             source_patterns=r"model.layers.(\d+).mlp.(gate|up|down)_proj.weight",
             target_patterns=r"model.layers.\1.post_attention_layernorm.\2_proj.weight",
         ),
@@ -32,12 +32,15 @@ class NeuronRMSNormMLPLayout(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
         if config.hidden_act != "silu":
             raise ValueError(f"Unsupported activation function: {config.hidden_act}. Only 'silu' is supported.")
 
         self.activation_fn = ActFnType.SiLU
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        pass
 
 
 class NeuronRMSNormMLP(nn.Module):
