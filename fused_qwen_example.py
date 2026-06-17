@@ -88,9 +88,18 @@ with torch.no_grad():
     fused_out = fused_model(**inputs).logits
 print("Fused output shape:", fused_out.shape)
 
+# --- compiled model ---
+
+compiled_model = torch.compile(baseline, backend="neuron")
+with torch.no_grad():
+    compiled_out = compiled_model(**inputs).logits
+print("Compiled output shape:", compiled_out.shape)
+
+
 # --- compare ---
 print("=" * 60)
-print("Max diff fused vs baseline:", (fused_out - baseline_out).abs().max().item())
+print("Max diff fused vs baseline:   ", (fused_out - baseline_out).abs().max().item())
+print("Max diff compiled vs baseline:", (compiled_out - baseline_out).abs().max().item())
 
 
 # --- benchmark ---
@@ -117,8 +126,12 @@ print("=" * 60)
 print("Benchmarking...")
 baseline_ms = benchmark(baseline, inputs, "baseline")
 fused_ms = benchmark(fused_model, inputs, "fused")
+compiled_ms = benchmark(compiled_model, inputs, "compiled")
 
 print("=" * 60)
 print(
-    f"Speedup: {baseline_ms / fused_ms:.2f}x  ({baseline_ms:.2f} ms → {fused_ms:.2f} ms)"
+    f"Speedup fused: {baseline_ms / fused_ms:.2f}x  ({baseline_ms:.2f} ms → {fused_ms:.2f} ms)"
+)
+print(
+    f"Speedup compiled: {baseline_ms / compiled_ms:.2f}x  ({baseline_ms:.2f} ms → {compiled_ms:.2f} ms)"
 )
