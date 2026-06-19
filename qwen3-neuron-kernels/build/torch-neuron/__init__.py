@@ -15,9 +15,19 @@ from nkilib.core.utils.common_types import (
 )
 from nkilib.core.qkv.qkv import qkv as nki_qkv
 from nkilib.core.attention.attention_cte import attention_cte as nki_attention_cte
+from nkilib.core.output_projection.output_projection_cte.output_projection_cte import (
+    output_projection_cte as nki_output_projection_cte,
+)
 from nkilib.experimental.mlp_mxfp8.mlp_fwd_mxfp8 import mlp_forward_mxfp8_nki
 
 _mlp_forward_mxfp8_nki = nki.jit(mlp_forward_mxfp8_nki)
+
+
+def _rotate_half(x):
+    """Rotate half the head dimension (GPT-NeoX / Qwen3 convention)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
 class NeuronRMSNormMLPLayout(nn.Module):
@@ -189,30 +199,45 @@ class NeuronQwen3Attention(nn.Module):
         B, S, H = hidden_states.shape
         cos, sin = position_embeddings  # each [B, S, D]
 
-        # Fused QKV projection + per-head QK-norm + RoPE
-        qkv_out = nki_qkv(
-            hidden_states,
-            self.fused_qkv_proj.weight.T,
-            output_layout=QKVOutputLayout.BSD,
-            fused_norm_type=NormType.NO_NORM,
-            fused_rope=True,
-            cos_cache=cos,
-            sin_cache=sin,
-            d_head=self.head_dim,
-            num_q_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            qk_norm_pre_rope=self.qk_norm_cfg,
-            qk_norm_pre_rope_q_gamma=self.q_norm.unsqueeze(0),  # [1, D]
-            qk_norm_pre_rope_k_gamma=self.k_norm.unsqueeze(0),  # [1, D]
-        )  # [B, S, (N_q + 2*N_kv) * D]
+        D = self.head_dim
+        N_q = self.num_heads
+        N_kv = self.num_kv_heads
 
-        # Split and reshape for attention_cte: [B*N, S, D]
-        q_size = self.num_heads * self.head_dim
-        kv_size = self.num_kv_heads * self.head_dim
-        q, k, v = qkv_out.split([q_size, kv_size, kv_size], dim=-1)
-        q = q.reshape(B * self.num_heads, S, self.head_dim)  # [B*N_q,  S, D]
-        k = k.reshape(B * self.num_kv_heads, S, self.head_dim)  # [B*N_kv, S, D]
-        v = v.reshape(B * self.num_kv_heads, S, self.head_dim)  # [B*N_kv, S, D]
+        # NOTE: We deliberately do NOT use nki_qkv here. Its prefill path
+        # (qkv_cte, selected for seqlen > SEQLEN_THRESHOLD_FOR_QKV_CTE == 96)
+        # is broken in this Neuron build: it does not write its output buffer,
+        # returning near-zero / non-deterministic garbage that then overflows
+        # to NaN downstream. The QKV projection is a cheap GEMM, so we compute
+        # it (plus QK-norm and RoPE) in torch and feed the result to the
+        # attention_cte kernel, which is correct and stable.
+        qkv = torch.matmul(hidden_states, self.fused_qkv_proj.weight.T)  # [B, S, (N_q+2*N_kv)*D]
+        q_size = N_q * D
+        kv_size = N_kv * D
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        q = q.view(B, S, N_q, D)
+        k = k.view(B, S, N_kv, D)
+        v = v.view(B, S, N_kv, D)
+
+        # Qwen3 RMS QK-norm over the head dimension (computed in fp32).
+        in_dtype = hidden_states.dtype
+        qf = q.float()
+        kf = k.float()
+        q = (qf * torch.rsqrt(qf.pow(2).mean(-1, keepdim=True) + self.qk_norm_eps) * self.q_norm).to(in_dtype)
+        k = (kf * torch.rsqrt(kf.pow(2).mean(-1, keepdim=True) + self.qk_norm_eps) * self.k_norm).to(in_dtype)
+
+        # [B, S, N, D] -> [B, N, S, D] and apply RoPE
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        cos_u = cos.unsqueeze(1)  # [B, 1, S, D]
+        sin_u = sin.unsqueeze(1)
+        q = q * cos_u + _rotate_half(q) * sin_u
+        k = k * cos_u + _rotate_half(k) * sin_u
+
+        # Reshape to attention_cte layout: [B*N, S, D]
+        q = q.reshape(B * N_q, S, D).contiguous()  # [B*N_q,  S, D]
+        k = k.reshape(B * N_kv, S, D).contiguous()  # [B*N_kv, S, D]
+        v = v.reshape(B * N_kv, S, D).contiguous()  # [B*N_kv, S, D]
 
         # Flash attention (causal, GQA via batch_size_q vs batch_size_kv)
         attn_out = nki_attention_cte(
@@ -226,10 +251,11 @@ class NeuronQwen3Attention(nn.Module):
             tp_out=False,
         )  # [B*N_q, S, D]
 
-        # Output projection
-        attn_out = attn_out.view(B, self.num_heads, S, self.head_dim)
-        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, -1)  # [B, S, N_q*D]
-        output = self.o_proj(attn_out)
+        # Output projection via NKI (output_projection_cte is correct & stable):
+        # reshape to [B, N_q, D, S] as the kernel expects.
+        attn_out = attn_out.reshape(B, N_q, S, D)
+        attn_out = attn_out.permute(0, 1, 3, 2)  # [B, N_q, D, S]
+        output = nki_output_projection_cte(attn_out, self.o_proj.weight.T)
 
         return output, None
 

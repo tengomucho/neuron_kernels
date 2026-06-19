@@ -19,13 +19,20 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, KernelConfig
 
 
-NUM_WARMUP = 10
-NUM_RUNS = 50
-SEQ_LEN = 1024
+NUM_WARMUP = int(os.environ.get("NUM_WARMUP", 10))
+NUM_RUNS = int(os.environ.get("NUM_RUNS", 50))
+SEQ_LEN = int(os.environ.get("SEQ_LEN", 1024))
 DTYPE = torch.bfloat16
 
 # model_id = "michaelbenayoun/qwen3-tiny-4kv-heads-4layers-random"
 model_id = "Qwen/Qwen3-0.6B"
+
+# Local kernel repo (the in-tree, patched kernel). Its layout is
+# qwen3-neuron-kernels/build/<variant>/__init__.py, which the `kernels` library
+# loads when given the repo root path + use_local_kernel=True.
+LOCAL_KERNEL_REPO = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "qwen3-neuron-kernels"
+)
 
 
 def benchmark(model, inputs, label):
@@ -49,15 +56,22 @@ def benchmark(model, inputs, label):
 
 
 def get_kernel_config():
-    """Returns the kernel configuration for Qwen3 model fusion."""
+    """Returns the kernel configuration for Qwen3 model fusion.
+
+    Uses the local, in-tree kernel repo (`LOCAL_KERNEL_REPO`) so the benchmark runs
+    the patched `NeuronQwen3Attention` (which bypasses the broken `qkv_cte` path)
+    instead of the version published on the Hub. `use_local_kernel=True` makes the
+    `kernels` library resolve the `path:LayerName` strings as local repositories.
+    """
     return KernelConfig(
         {
-            "Qwen3Attention": "michaelbenayoun/qwen3-neuron-kernels:NeuronQwen3Attention",
+            "Qwen3Attention": f"{LOCAL_KERNEL_REPO}:NeuronQwen3Attention",
             (
                 ("Qwen3RMSNorm", "model.layers.*.post_attention_layernorm"),
                 ("Qwen3MLP", "model.layers.*.mlp"),
-            ): "michaelbenayoun/qwen3-neuron-kernels:NeuronRMSNormMLP",
+            ): f"{LOCAL_KERNEL_REPO}:NeuronRMSNormMLP",
         },
+        use_local_kernel=True,
     )
 
 
@@ -139,10 +153,27 @@ if __name__ == "__main__":
     )
 
     # --- compare ---
+    # Compare against the baseline over the *real* (non-padding) tokens. The fused
+    # attention kernel applies causal masking only and ignores the padding mask, so
+    # padding positions diverge from the baseline (which masks them) -- that region is
+    # never used and would otherwise dominate a naive full-tensor max-diff. We also
+    # flag NaN/inf, which is the failure mode of the buggy kernel.
     print("=" * 60)
-    print("Max diff compiled vs baseline:", (compiled_out - baseline_out).abs().max().item())
-    print("Max diff fused vs baseline:", (fused_out - baseline_out).abs().max().item())
-    print("Max diff fused + compiled vs baseline:", (fused_compiled_out - baseline_out).abs().max().item())
+    real = inputs["attention_mask"].bool()[0]  # [S], still on CPU
+    base_cpu = baseline_out.detach().to("cpu", torch.float32)
+
+    def report(name, out):
+        o = out.detach().to("cpu", torch.float32)
+        bad = torch.isnan(o).any().item() or torch.isinf(o).any().item()
+        d_all = (o - base_cpu).abs().max().item()
+        d_real = (o[:, real, :] - base_cpu[:, real, :]).abs().max().item()
+        argmax_agree = (o[:, real, :].argmax(-1) == base_cpu[:, real, :].argmax(-1)).float().mean().item()
+        print(f"{name:24s} nan/inf={bad}  maxdiff(real tokens)={d_real:.4f}  "
+              f"argmax agree={argmax_agree:.3f}  (maxdiff all incl. padding={d_all:.2f})")
+
+    report("compiled vs baseline", compiled_out)
+    report("fused vs baseline", fused_out)
+    report("fused + compiled vs baseline", fused_compiled_out)
 
     # --- results ---
     print("=" * 60)
