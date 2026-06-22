@@ -6,14 +6,22 @@ no project dependencies beyond `torch` + `nkilib`).
 ## Summary
 
 `nkilib.core.qkv.qkv` (`nki_qkv`), on its **context-encoding / prefill path
-`qkv_cte`** (selected when `seqlen > SEQLEN_THRESHOLD_FOR_QKV_CTE == 96`), does not
-correctly produce its output. It returns **near-zero, input-independent, and
-non-deterministic** values — consistent with an unwritten / partially-written
-`shared_hbm` output buffer, likely compounded by an LNC2 cross-core race. The garbage
-propagates downstream and overflows to `inf`/`NaN` after subsequent operations.
+`qkv_cte`** (selected when `seqlen > SEQLEN_THRESHOLD_FOR_QKV_CTE == 96`), returns an
+**all-zero** output instead of the QKV projection. The root cause has two parts (see
+"Root cause" below for the instrumented detail):
 
-The `qkv_tkg` path (`seqlen <= 96`) is correct. `attention_cte` and
-`output_projection_cte` are correct and stable.
+- **Bug A:** `_multi_buffering_degree_for_seqlen()` computes a **negative**
+  `s_multi_buffer_degree` (the lookahead SBUF-space estimate exceeds available SBUF for
+  H=1024/I=4096), which collapses the block count to 0 and **skips the entire projection
+  loop**, so the output buffer is never written.
+- **Bug B:** even after clamping the degree to ≥ 1 so the loop runs, the CTE output is
+  still never delivered to the caller — a forced write to the output buffer does not
+  appear in the returned tensor, while the structurally-identical `qkv_tkg` path works.
+  This points to an output-binding problem in `qkv_cte`'s codegen.
+
+The all-zero (or, with real weights, uninitialised-HBM) output propagates downstream and
+overflows to `inf`/`NaN`. The `qkv_tkg` path (`seqlen <= 96`) is correct, as are
+`attention_cte` and `output_projection_cte`.
 
 ## Environment
 
@@ -49,32 +57,63 @@ to `inf`/`NaN`.
 ## Key diagnostic signals
 
 - Output magnitude is ~0 and independent of the input → output buffer not written.
-- Output **changes between identical consecutive calls** → reads uninitialized HBM;
-  suggests a missing barrier / sharding race on the LNC2 write path.
 - QK-norm config (`qk_norm_pre_rope`) has **no effect** on the output → the projection
   itself is never correctly computed on the CTE path.
-- The TKG path (single-core, `seqlen <= 96`) is correct.
+- The TKG path (`seqlen <= 96`) is correct.
+- `NEURON_RT_NUM_CORES=1` does **not** change the result (this does not necessarily alter
+  the kernel's internal SPMD grid, but together with the root-cause analysis below an
+  LNC2 cross-core race is **not** the cause — the block loop is simply skipped).
+- With real Qwen3 weights the CTE output is small **non-deterministic** garbage rather
+  than a clean zero (uninitialised-HBM read); with random weights it is exactly zero.
 
-## Suspected area
+## Root cause (instrumented on trn2.48xlarge)
 
-`nkilib/core/qkv/qkv_cte.py`, `_qkv_cte_impl` BSD output write
-(`nisa.dma_copy(dst=output_hbm.ap(...), src=output_sb[...])` around the
-`cfg.output_layout == QKVOutputLayout.BSD` branch), the matmul→`output_sb` chain
-(`nc_matmul` into `qkv_MM_output_psum`, evicted to `output_sb`), and the LNC2 sharding
-(`dims.S_shard_offset` / `S_shard`) + end barrier
-(`get_verified_program_sharding_info("qkv_cte_barrier", ...)` /
-`nisa.core_barrier(output_hbm, (0, 1))`).
+Debugging was done with a local editable copy of `qkv_cte.py`
+(`qwen3-neuron-kernels/qkv_cte_local.py`, driven by `repro_qkv_cte_bug.py --local`).
+NOTE: the NKI on-disk compile cache (`nki/compiler/disk_cache.py`) must be disabled
+(`NKI_DISABLE_COMPILE_CACHE=1`) or source edits silently have no effect.
 
-Isolation attempts that did **not** change the (bit-identical broken) output:
-- `NEURON_RT_NUM_CORES=1` — likely does not alter the kernel's *internal* SPMD grid on
-  an LNC=2 part, so it does not cleanly rule out the sharding race.
-- `load_input_with_DMA_transpose=False` — appears ignored internally on this path.
+**Bug A — negative multi-buffering degree skips ALL compute (primary cause).**
+`_multi_buffering_degree_for_seqlen()` computes a **negative** `s_multi_buffer_degree`.
+Printed values for H=1024, I=4096 (per partition):
 
-Within one process the output varies between consecutive identical calls (S=128:
-12.158 then 12.172); across processes it is reproducible for a fixed compiled NEFF —
-i.e. an uninitialized-buffer read with a deterministic allocation pattern. Confirming
-the exact cause requires dumping intermediate `input_sb` / `weights_sb` / PSUM tiles
-inside `_qkv_cte_impl`.
+```
+total_available_sbuf_space_to_this_kernel = 212984 B  (~208 KB)
+sbuf_tile_space_non_buffered              = 262148 B   <-- exceeds available
+  of which weights_space_per_partition    = 262144 B   (256 KB, dominant term)
+sbuf_tile_space_pre_buffering             = 10240 B
+max_s_buffer_without_exceeding_sbuf = (212984 - 262148) // 10240 = -5
+s_multi_buffer_degree = min(initial_degree, -5) = -5      # no clamp to >= 1
+```
+
+Then `S_BLOCK_SIZE = degree * min(S_shard,128) < 0` and
+`num_blocks_per_S_shard = ceil(S_shard / S_BLOCK_SIZE) if S_BLOCK_SIZE > 0 else 0 = 0`,
+so `for i_block_S in nl.affine_range(0)` runs **zero iterations** — the QKV projection
+is never computed and `output_hbm` is returned as freshly-allocated zeros (→ NaN
+downstream). The lookahead `weights_space_per_partition` estimate (256 KB) alone
+exceeds the available SBUF (208 KB), which is the source of the negative value.
+Two fixes are needed: (1) clamp `s_multi_buffer_degree = max(1, ...)`; (2) correct the
+over-large non-prefetched weights-space estimate so it does not exceed available SBUF.
+
+**Bug B — CTE output is not bound to the kernel result (still unresolved).**
+After clamping the degree to 1 (loop now runs: `degree=1`, `num_blocks=1/2`), the CTE
+output is *still* all zeros. A forced sentinel write of a constant to `output_hbm`
+(tested inside the block loop, in `qkv_cte`'s outer scope, via both `.ap(pattern=...)`
+and plain slicing, with `dge_mode` `swdge` and `none`) **never appears in the returned
+tensor**, while the structurally-identical `qkv_tkg` path writes its internally-
+allocated `nl.shared_hbm` output correctly through the same dispatcher/return. This
+indicates the CTE kernel's internally-allocated output is not wired as the kernel
+result — consistent with the `qkv()` entry's
+`experimental_flags="skip-non-top-level-shared-hbm-check"` masking a real output-binding
+problem in codegen. This part needs AWS/compiler-level investigation (e.g. dumping the
+generated IR, or having `qkv_cte` accept/return the output at the jit top level).
+
+Ruled out as causes of Bug B: cross-module monkeypatch, DMA addressing style
+(`.ap` vs slice), `dge_mode` (`swdge` vs `none`), placement inside vs outside
+`nl.affine_range`, the `use_BxS_input_reshape` output reshape, and allocating the
+output at the jit top level and passing it in via `output_hbm=` (still zero, while the
+internally-allocating `qkv_tkg` works — so the binding failure is specific to the
+`qkv_cte` codegen, not where/how the output buffer is allocated).
 
 ## Workaround (in our model wrapper)
 
