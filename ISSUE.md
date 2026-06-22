@@ -14,10 +14,11 @@ no project dependencies beyond `torch` + `nkilib`).
   `s_multi_buffer_degree` (the lookahead SBUF-space estimate exceeds available SBUF for
   H=1024/I=4096), which collapses the block count to 0 and **skips the entire projection
   loop**, so the output buffer is never written.
-- **Bug B:** even after clamping the degree to ≥ 1 so the loop runs, the CTE output is
-  still never delivered to the caller — a forced write to the output buffer does not
-  appear in the returned tensor, while the structurally-identical `qkv_tkg` path works.
-  This points to an output-binding problem in `qkv_cte`'s codegen.
+- **Bug B:** even after clamping the degree to ≥ 1 so the loop runs (and with all caches
+  cleared), the CTE output is still all zeros — yet the generated **BIR is correct**
+  (full matmul/eviction/store, output declared and written, valid non-overlapping
+  allocations). So this defect is in **BIR→NEFF (neuronx-cc) or runtime**, below the NKI
+  Python layer, and needs AWS compiler-team investigation.
 
 The all-zero (or, with real weights, uninitialised-HBM) output propagates downstream and
 overflows to `inf`/`NaN`. The `qkv_tkg` path (`seqlen <= 96`) is correct, as are
@@ -95,25 +96,33 @@ exceeds the available SBUF (208 KB), which is the source of the negative value.
 Two fixes are needed: (1) clamp `s_multi_buffer_degree = max(1, ...)`; (2) correct the
 over-large non-prefetched weights-space estimate so it does not exceed available SBUF.
 
-**Bug B — CTE output is not bound to the kernel result (still unresolved).**
+**Bug B — correct BIR still yields a zero output (below the NKI Python layer).**
 After clamping the degree to 1 (loop now runs: `degree=1`, `num_blocks=1/2`), the CTE
-output is *still* all zeros. A forced sentinel write of a constant to `output_hbm`
-(tested inside the block loop, in `qkv_cte`'s outer scope, via both `.ap(pattern=...)`
-and plain slicing, with `dge_mode` `swdge` and `none`) **never appears in the returned
-tensor**, while the structurally-identical `qkv_tkg` path writes its internally-
-allocated `nl.shared_hbm` output correctly through the same dispatcher/return. This
-indicates the CTE kernel's internally-allocated output is not wired as the kernel
-result — consistent with the `qkv()` entry's
-`experimental_flags="skip-non-top-level-shared-hbm-check"` masking a real output-binding
-problem in codegen. This part needs AWS/compiler-level investigation (e.g. dumping the
-generated IR, or having `qkv_cte` accept/return the output at the jit top level).
+output is *still* all zeros, even with all NKI/neuronx-cc caches cleared
+(`NKI_DISABLE_COMPILE_CACHE=1` + `rm -rf /tmp/neuron_backend /var/tmp/nki-* /tmp/nki_*`).
 
-Ruled out as causes of Bug B: cross-module monkeypatch, DMA addressing style
-(`.ap` vs slice), `dge_mode` (`swdge` vs `none`), placement inside vs outside
-`nl.affine_range`, the `use_BxS_input_reshape` output reshape, and allocating the
-output at the jit top level and passing it in via `output_hbm=` (still zero, while the
-internally-allocating `qkv_tkg` works — so the binding failure is specific to the
-`qkv_cte` codegen, not where/how the output buffer is allocated).
+The generated kernel BIR was dumped and inspected for the projection-only seqlen=128
+case. **The BIR is correct:**
+- `output_0` is declared with `kind: "Output"`, shape `[1,128,4096]`.
+- The instruction stream is complete and connected: 8 `DMACopy` load
+  `fused_qkv_weights` → SBUF `_bind_2_2`; 1 `DMACopy` loads `input` → `_bind_3_3`;
+  64 `Matmult` read (`_bind_2_2`, `_bind_3_3`) → PSUM `_bind_5..12`; 8 `TensorCopy`
+  evict PSUM → `_bind_4_4` (output SBUF); a final `DMACopy` (I-83) stores
+  `_bind_4_4` → `output_0`.
+- All SBUF allocations are valid, non-overlapping, and fit (max end 75808 B <
+  212984 B); every instruction has `can_read_uninit=false`.
+
+So at the BIR level the kernel computes the projection and writes the output. Yet the
+returned tensor is all zeros (a forced sentinel store of a constant to `output_hbm`
+also fails to appear). With a correct BIR and cleared caches, the defect must be in
+**BIR→NEFF compilation (neuronx-cc) or runtime execution** — outside the NKI Python
+layer. This needs AWS/compiler-team investigation (NEFF disassembly / hardware trace).
+
+Ruled out as Python-level causes of Bug B: cross-module monkeypatch; DMA addressing
+style (`.ap` vs slice); `dge_mode` (`swdge` vs `none`); placement inside vs outside
+`nl.affine_range`; the `use_BxS_input_reshape` output reshape; allocating the output at
+the jit top level and passing it via `output_hbm=`; SBUF allocation overflow/overlap
+(verified absent in the BIR); and the compile cache (cleared).
 
 ## Workaround (in our model wrapper)
 
