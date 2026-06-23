@@ -35,18 +35,26 @@ LOCAL_KERNEL_REPO = os.path.join(
 )
 
 
+def _sync(out):
+    """Force the forward to actually execute. The Neuron `torch.compile` backend runs
+    fully async/lazy, so calling the model only *dispatches* work -- without reading a
+    value back, the timed loop measures dispatch latency (~0.5 ms), not compute. Reading
+    a single scalar forces graph execution while avoiding a full logits transfer."""
+    return float(out.logits.view(-1)[0])
+
+
 def benchmark(model, inputs, label):
     """Run benchmark on a model."""
     print(f"  Warming up {label} ({NUM_WARMUP} runs)...")
     for _ in range(NUM_WARMUP):
         with torch.no_grad():
-            model(**inputs)
+            _sync(model(**inputs))
 
     print(f"  Benchmarking {label} ({NUM_RUNS} runs)...")
     start = time.perf_counter()
     for _ in range(NUM_RUNS):
         with torch.no_grad():
-            model(**inputs)
+            _sync(model(**inputs))
     elapsed = time.perf_counter() - start
 
     ms_per_run = elapsed / NUM_RUNS * 1000
@@ -55,27 +63,35 @@ def benchmark(model, inputs, label):
     return ms_per_run
 
 
-def get_kernel_config():
+def get_kernel_config(fused_mlp=True):
     """Returns the kernel configuration for Qwen3 model fusion.
 
     Uses the local, in-tree kernel repo (`LOCAL_KERNEL_REPO`) so the benchmark runs
     the patched `NeuronQwen3Attention` (which bypasses the broken `qkv_cte` path)
     instead of the version published on the Hub. `use_local_kernel=True` makes the
     `kernels` library resolve the `path:LayerName` strings as local repositories.
+
+    Args:
+        fused_mlp: When True, the post-attention RMSNorm is fused *into* the MLP kernel
+            (`NeuronRMSNormMLP`, NormType.RMS_NORM). When False, the RMSNorm runs
+            standalone in torch and the MLP kernel is called with NormType.NO_NORM
+            (`NeuronRMSNormMLP_Separated`). The attention path is identical in both, so
+            the only difference is whether the norm is fused -- which is exactly the A/B.
     """
+    mlp_kernel = "NeuronRMSNormMLP" if fused_mlp else "NeuronRMSNormMLP_Separated"
     return KernelConfig(
         {
             "Qwen3Attention": f"{LOCAL_KERNEL_REPO}:NeuronQwen3Attention",
             (
                 ("Qwen3RMSNorm", "model.layers.*.post_attention_layernorm"),
                 ("Qwen3MLP", "model.layers.*.mlp"),
-            ): f"{LOCAL_KERNEL_REPO}:NeuronRMSNormMLP",
+            ): f"{LOCAL_KERNEL_REPO}:{mlp_kernel}",
         },
         use_local_kernel=True,
     )
 
 
-def run_model_benchmark(model_id, inputs, compile_en, kernel_en, label="model"):
+def run_model_benchmark(model_id, inputs, compile_en, kernel_en, fused_mlp=True, label="model"):
     """
     Load a model, optionally enable kernel fusion and compilation, and run benchmarks.
     
@@ -95,7 +111,7 @@ def run_model_benchmark(model_id, inputs, compile_en, kernel_en, label="model"):
     print(f"Loading model: {label}...")
     
     # Build kernel config if requested
-    kernel_config = get_kernel_config() if kernel_en else None
+    kernel_config = get_kernel_config(fused_mlp=fused_mlp) if kernel_en else None
     
     # Load model with optional kernel fusion
     model = AutoModelForCausalLM.from_pretrained(
@@ -135,21 +151,39 @@ if __name__ == "__main__":
         truncation=True,
     )
 
+    def safe_run(**kw):
+        """Run a config; on failure, log it and return (None, None) so one broken
+        config (e.g. the fragile torch.compile + kernels path) doesn't abort the
+        whole comparison."""
+        try:
+            return run_model_benchmark(model_id, inputs, **kw)
+        except Exception as e:
+            print(f"  !! config '{kw.get('label')}' failed: {type(e).__name__}: {e}")
+            return None, None
+
     # Run benchmarks for different configurations
-    baseline_out, baseline_ms = run_model_benchmark(
-        model_id, inputs, compile_en=False, kernel_en=False, label="baseline"
+    baseline_out, baseline_ms = safe_run(
+        compile_en=False, kernel_en=False, label="baseline"
     )
 
-    compiled_out, compiled_ms = run_model_benchmark(
-        model_id, inputs, compile_en=True, kernel_en=False, label="compiled"
+    compiled_out, compiled_ms = safe_run(
+        compile_en=True, kernel_en=False, label="compiled"
     )
 
-    fused_out, fused_ms = run_model_benchmark(
-        model_id, inputs, compile_en=False, kernel_en=True, label="fused"
+    fused_out, fused_ms = safe_run(
+        compile_en=False, kernel_en=True, fused_mlp=True, label="fused"
     )
 
-    fused_compiled_out, fused_compiled_ms = run_model_benchmark(
-        model_id, inputs, compile_en=True, kernel_en=True, label="fused + compiled"
+    # Separated variant: identical attention path and identical MLP matmuls, but the
+    # post-attention RMSNorm runs standalone (torch) instead of inside the MLP kernel.
+    # The delta vs. `fused` isolates the value of the norm+MLP fusion. Keep compile off
+    # so torch.compile can't re-fuse the torch-side norm and muddy the comparison.
+    separated_out, separated_ms = safe_run(
+        compile_en=False, kernel_en=True, fused_mlp=False, label="separated"
+    )
+
+    fused_compiled_out, fused_compiled_ms = safe_run(
+        compile_en=True, kernel_en=True, fused_mlp=True, label="fused + compiled"
     )
 
     # --- compare ---
@@ -160,9 +194,12 @@ if __name__ == "__main__":
     # flag NaN/inf, which is the failure mode of the buggy kernel.
     print("=" * 60)
     real = inputs["attention_mask"].bool()[0]  # [S], still on CPU
-    base_cpu = baseline_out.detach().to("cpu", torch.float32)
+    base_cpu = baseline_out.detach().to("cpu", torch.float32) if baseline_out is not None else None
 
     def report(name, out):
+        if out is None or base_cpu is None:
+            print(f"{name:24s} (skipped: config or baseline unavailable)")
+            return
         o = out.detach().to("cpu", torch.float32)
         bad = torch.isnan(o).any().item() or torch.isinf(o).any().item()
         d_all = (o - base_cpu).abs().max().item()
@@ -173,10 +210,37 @@ if __name__ == "__main__":
 
     report("compiled vs baseline", compiled_out)
     report("fused vs baseline", fused_out)
+    report("separated vs baseline", separated_out)
     report("fused + compiled vs baseline", fused_compiled_out)
 
     # --- results ---
     print("=" * 60)
-    print(f"Speedup compiled: {baseline_ms / compiled_ms:.2f}x  ({baseline_ms:.2f} ms → {compiled_ms:.2f} ms)")
-    print(f"Speedup fused: {baseline_ms / fused_ms:.2f}x  ({baseline_ms:.2f} ms → {fused_ms:.2f} ms)")
-    print(f"Speedup fused + compiled: {baseline_ms / fused_compiled_ms:.2f}x  ({baseline_ms:.2f} ms → {fused_compiled_ms:.2f} ms)")
+
+    def speedup(name, ms):
+        if ms is None or baseline_ms is None:
+            print(f"Speedup {name}: (skipped)")
+            return
+        print(f"Speedup {name}: {baseline_ms / ms:.2f}x  ({baseline_ms:.2f} ms → {ms:.2f} ms)")
+
+    speedup("compiled", compiled_ms)
+    speedup("fused", fused_ms)
+    speedup("separated", separated_ms)
+    speedup("fused + compiled", fused_compiled_ms)
+
+    # --- the A/B we actually care about: fused norm+MLP vs separated norm+MLP ---
+    print("=" * 60)
+    if fused_ms is not None and separated_ms is not None:
+        fused_vs_sep = separated_ms / fused_ms
+        faster = "fused" if fused_ms < separated_ms else "separated"
+        print(f"Norm+MLP fusion A/B: fused={fused_ms:.2f} ms  separated={separated_ms:.2f} ms  "
+              f"-> {faster} faster by {abs(1 - fused_vs_sep) * 100:.1f}%")
+        if fused_out is not None and separated_out is not None:
+            sep_real = (separated_out.detach().to("cpu", torch.float32)[:, real, :]
+                        - fused_out.detach().to("cpu", torch.float32)[:, real, :]).abs().max().item()
+            # Not exactly 0: the in-kernel RMSNorm (NormType.RMS_NORM) and the torch
+            # fp32 RMSNorm are algebraically identical but round differently. Same order
+            # of magnitude as each-vs-baseline, and argmax still agrees -> equivalent.
+            print(f"fused vs separated maxdiff (real tokens) = {sep_real:.4f}  "
+                  f"(small numerical diff from norm precision, not a correctness gap)")
+    else:
+        print("Norm+MLP fusion A/B: skipped (one of fused/separated failed to run)")

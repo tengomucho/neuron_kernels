@@ -260,7 +260,50 @@ class NeuronQwen3Attention(nn.Module):
         return output, None
 
 
+# IMPORTANT: keep the separated-variant classes below at the END of this module, after
+# NeuronQwen3Attention. Inserting them earlier shifts the source line numbers of the
+# classes defined below them, which deterministically breaks the `torch.compile`
+# (backend="neuron") path for the attention kernel -- it falls into a buggy CPU-fallback
+# graph (float32 embedding indices -> RuntimeError). The neuron compiler is sensitive to
+# the source location of the kernel classes, so do not move existing classes around.
+class NeuronRMSNormMLP_SeparatedLayout(NeuronRMSNormMLPLayout):
+    """Same weight layout as the fused norm+MLP, used by the *separated* variant.
+
+    Reuses the identical conversion_mapping and __init__ so the checkpoint loads the
+    same way; only the forward differs (RMSNorm in torch, MLP kernel with NO_NORM).
+    """
+
+    pass
+
+
+class NeuronRMSNormMLP_Separated(nn.Module):
+    """Separated variant: RMSNorm computed in torch, then nki_mlp with normalization
+    disabled. Numerically equivalent to NeuronRMSNormMLP; used to measure the value of
+    fusing the norm *into* the MLP kernel (vs. a standalone norm + un-normed MLP).
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Qwen3 RMSNorm (fp32 reduction, weight applied in input dtype), matching HF.
+        input_dtype = hidden_states.dtype
+        hs = hidden_states.to(torch.float32)
+        variance = hs.pow(2).mean(-1, keepdim=True)
+        hs = hs * torch.rsqrt(variance + self.variance_epsilon)
+        normed = (self.norm_weight * hs.to(input_dtype))
+
+        return nki_mlp(
+            normed,
+            gate_proj_weights_tensor=self.gate_proj.weight.T,
+            up_proj_weights_tensor=self.up_proj.weight.T,
+            down_proj_weights_tensor=self.down_proj.weight.T,
+            activation_fn=self.activation_fn,
+            normalization_type=NormType.NO_NORM,
+            quantization_type=QuantizationType.NONE,
+            eps=self.variance_epsilon,
+        )[0]  # nki_mlp returns a list, the first element is the output tensor.
+
+
 class layers:
     NeuronRMSNormMLP = NeuronRMSNormMLP
+    NeuronRMSNormMLP_Separated = NeuronRMSNormMLP_Separated
     NeuronMLPMXFP8 = NeuronMLPMXFP8
     NeuronQwen3Attention = NeuronQwen3Attention
