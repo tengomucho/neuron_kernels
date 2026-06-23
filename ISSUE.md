@@ -24,6 +24,13 @@ The all-zero (or, with real weights, uninitialised-HBM) output propagates downst
 overflows to `inf`/`NaN`. The `qkv_tkg` path (`seqlen <= 96`) is correct, as are
 `attention_cte` and `output_projection_cte`.
 
+**Scope note:** the `> 96` is only the dispatcher threshold (`SEQLEN_THRESHOLD_FOR_QKV_CTE`
+in `qkv.py`) that routes to `qkv_cte` vs `qkv_tkg`; it is **not** a magic boundary inside
+the kernel. The defect is in `qkv_cte` itself — both the negative-degree calc (Bug A,
+which depends on H/I/SBUF sizing, not on the seqlen value) and the BIR→NEFF/runtime issue
+(Bug B) apply to `qkv_cte` regardless of sequence length. `qkv_cte` is simply never
+exercised for `seqlen <= 96` because the dispatcher routes those to `qkv_tkg`.
+
 ## Environment
 
 - Platform: AWS Trainium2 (`trn2.48xlarge`, LNC=2)
