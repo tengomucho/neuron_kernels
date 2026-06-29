@@ -91,17 +91,19 @@ def get_kernel_config(fused_mlp=True):
     )
 
 
-def run_model_benchmark(model_id, inputs, compile_en, kernel_en, fused_mlp=True, label="model"):
+def run_model_benchmark(
+    model_id, inputs, compile_en, kernel_en, fused_mlp=True, label="model"
+):
     """
     Load a model, optionally enable kernel fusion and compilation, and run benchmarks.
-    
+
     Args:
         model_id: HuggingFace model identifier
         inputs: Tokenized inputs (dict with 'input_ids', 'attention_mask', etc.)
         compile_en: Whether to apply torch.compile with neuron backend
         kernel_en: Whether to enable kernel fusion
         label: Label for benchmark output
-    
+
     Returns:
         Tuple of (reference_output, benchmark_ms):
             - reference_output: Model logits output
@@ -109,10 +111,10 @@ def run_model_benchmark(model_id, inputs, compile_en, kernel_en, fused_mlp=True,
     """
     print("=" * 60)
     print(f"Loading model: {label}...")
-    
+
     # Build kernel config if requested
     kernel_config = get_kernel_config(fused_mlp=fused_mlp) if kernel_en else None
-    
+
     # Load model with optional kernel fusion
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -121,23 +123,23 @@ def run_model_benchmark(model_id, inputs, compile_en, kernel_en, fused_mlp=True,
         dtype=DTYPE,
         device_map="neuron",
     )
-        
+
     model.eval()
-    
+
     # Move inputs to model device and get reference output
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     with torch.no_grad():
         reference_out = model(**inputs).logits
     print(f"Output shape: {reference_out.shape}")
-    
+
     # Apply torch.compile if requested
     if compile_en:
         print(f"  Compiling with neuron backend...")
         model = torch.compile(model, backend="neuron")
-    
+
     # Run benchmark
     benchmark_ms = benchmark(model, inputs, label)
-    
+
     return reference_out, benchmark_ms
 
 
@@ -194,7 +196,11 @@ if __name__ == "__main__":
     # flag NaN/inf, which is the failure mode of the buggy kernel.
     print("=" * 60)
     real = inputs["attention_mask"].bool()[0]  # [S], still on CPU
-    base_cpu = baseline_out.detach().to("cpu", torch.float32) if baseline_out is not None else None
+    base_cpu = (
+        baseline_out.detach().to("cpu", torch.float32)
+        if baseline_out is not None
+        else None
+    )
 
     def report(name, out):
         if out is None or base_cpu is None:
@@ -204,9 +210,16 @@ if __name__ == "__main__":
         bad = torch.isnan(o).any().item() or torch.isinf(o).any().item()
         d_all = (o - base_cpu).abs().max().item()
         d_real = (o[:, real, :] - base_cpu[:, real, :]).abs().max().item()
-        argmax_agree = (o[:, real, :].argmax(-1) == base_cpu[:, real, :].argmax(-1)).float().mean().item()
-        print(f"{name:24s} nan/inf={bad}  maxdiff(real tokens)={d_real:.4f}  "
-              f"argmax agree={argmax_agree:.3f}  (maxdiff all incl. padding={d_all:.2f})")
+        argmax_agree = (
+            (o[:, real, :].argmax(-1) == base_cpu[:, real, :].argmax(-1))
+            .float()
+            .mean()
+            .item()
+        )
+        print(
+            f"{name:24s} nan/inf={bad}  maxdiff(real tokens)={d_real:.4f}  "
+            f"argmax agree={argmax_agree:.3f}  (maxdiff all incl. padding={d_all:.2f})"
+        )
 
     report("compiled vs baseline", compiled_out)
     report("fused vs baseline", fused_out)
@@ -220,7 +233,9 @@ if __name__ == "__main__":
         if ms is None or baseline_ms is None:
             print(f"Speedup {name}: (skipped)")
             return
-        print(f"Speedup {name}: {baseline_ms / ms:.2f}x  ({baseline_ms:.2f} ms → {ms:.2f} ms)")
+        print(
+            f"Speedup {name}: {baseline_ms / ms:.2f}x  ({baseline_ms:.2f} ms → {ms:.2f} ms)"
+        )
 
     speedup("compiled", compiled_ms)
     speedup("fused", fused_ms)
@@ -232,15 +247,26 @@ if __name__ == "__main__":
     if fused_ms is not None and separated_ms is not None:
         fused_vs_sep = separated_ms / fused_ms
         faster = "fused" if fused_ms < separated_ms else "separated"
-        print(f"Norm+MLP fusion A/B: fused={fused_ms:.2f} ms  separated={separated_ms:.2f} ms  "
-              f"-> {faster} faster by {abs(1 - fused_vs_sep) * 100:.1f}%")
+        print(
+            f"Norm+MLP fusion A/B: fused={fused_ms:.2f} ms  separated={separated_ms:.2f} ms  "
+            f"-> {faster} faster by {abs(1 - fused_vs_sep) * 100:.1f}%"
+        )
         if fused_out is not None and separated_out is not None:
-            sep_real = (separated_out.detach().to("cpu", torch.float32)[:, real, :]
-                        - fused_out.detach().to("cpu", torch.float32)[:, real, :]).abs().max().item()
+            sep_real = (
+                (
+                    separated_out.detach().to("cpu", torch.float32)[:, real, :]
+                    - fused_out.detach().to("cpu", torch.float32)[:, real, :]
+                )
+                .abs()
+                .max()
+                .item()
+            )
             # Not exactly 0: the in-kernel RMSNorm (NormType.RMS_NORM) and the torch
             # fp32 RMSNorm are algebraically identical but round differently. Same order
             # of magnitude as each-vs-baseline, and argmax still agrees -> equivalent.
-            print(f"fused vs separated maxdiff (real tokens) = {sep_real:.4f}  "
-                  f"(small numerical diff from norm precision, not a correctness gap)")
+            print(
+                f"fused vs separated maxdiff (real tokens) = {sep_real:.4f}  "
+                f"(small numerical diff from norm precision, not a correctness gap)"
+            )
     else:
         print("Norm+MLP fusion A/B: skipped (one of fused/separated failed to run)")

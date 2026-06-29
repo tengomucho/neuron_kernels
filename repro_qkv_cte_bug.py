@@ -14,6 +14,7 @@ No model / Hugging Face download required -- only torch + nkilib on a Trainium h
 Usage:
     python repro_qkv_cte_bug.py
 """
+
 import torch
 
 import nki
@@ -23,14 +24,14 @@ from nkilib.core.qkv.qkv import SEQLEN_THRESHOLD_FOR_QKV_CTE
 from nkilib.core.utils.common_types import QKVOutputLayout, NormType
 
 # Qwen3-0.6B attention dimensions (the bug is not specific to these values).
-H = 1024          # hidden size
-D = 128           # head dim
-N_Q = 16          # query heads
-N_KV = 8          # key/value heads
-I = (N_Q + 2 * N_KV) * D   # fused qkv output dim = 4096
+H = 1024  # hidden size
+D = 128  # head dim
+N_Q = 16  # query heads
+N_KV = 8  # key/value heads
+I = (N_Q + 2 * N_KV) * D  # fused qkv output dim = 4096
 DEVICE = "neuron"
 DTYPE = torch.bfloat16
-TOL = 0.1         # generous bf16 tolerance; correct path lands ~0.03
+TOL = 0.1  # generous bf16 tolerance; correct path lands ~0.03
 
 
 def versions():
@@ -40,9 +41,11 @@ def versions():
         except Exception:
             try:
                 import importlib.metadata as m
+
                 return m.version(mod)
             except Exception:
                 return "?"
+
     print("=" * 70)
     print("Environment")
     print(f"  nki          : {v('nki')}")
@@ -59,18 +62,22 @@ def run_case(seqlen, weights_cpu):
     B = 1
     torch.manual_seed(0)
     hidden_cpu = torch.randn(B, seqlen, H, dtype=torch.float32)
-    ref = hidden_cpu @ weights_cpu.T                       # [B, seqlen, I]
+    ref = hidden_cpu @ weights_cpu.T  # [B, seqlen, I]
     hidden = hidden_cpu.to(DEVICE, DTYPE)
     weights = weights_cpu.to(DEVICE, DTYPE)
 
-    path = "qkv_tkg (decode)" if seqlen <= SEQLEN_THRESHOLD_FOR_QKV_CTE else "qkv_cte (prefill)"
+    path = (
+        "qkv_tkg (decode)"
+        if seqlen <= SEQLEN_THRESHOLD_FOR_QKV_CTE
+        else "qkv_cte (prefill)"
+    )
     print(f"\nseqlen={seqlen:<5}  path={path}")
     diffs = []
     outs = []
     for r in range(2):
         out = nki_qkv(
             hidden,
-            weights.T,                                     # [H, I]
+            weights.T,  # [H, I]
             output_layout=QKVOutputLayout.BSD,
             fused_norm_type=NormType.NO_NORM,
             fused_rope=False,
@@ -82,21 +89,25 @@ def run_case(seqlen, weights_cpu):
         d = (out_cpu - ref).abs().max().item()
         diffs.append(d)
         outs.append(out_cpu)
-        print(f"  run{r+1}: maxdiff_vs_(hidden@W.T)={d:8.4f}   "
-              f"ref_range=[{ref.min():.2f},{ref.max():.2f}]   "
-              f"kernel_range=[{out_cpu.min():.2f},{out_cpu.max():.2f}]")
+        print(
+            f"  run{r + 1}: maxdiff_vs_(hidden@W.T)={d:8.4f}   "
+            f"ref_range=[{ref.min():.2f},{ref.max():.2f}]   "
+            f"kernel_range=[{out_cpu.min():.2f},{out_cpu.max():.2f}]"
+        )
 
     nondet = (outs[0] - outs[1]).abs().max().item()
     ok = max(diffs) < TOL
-    print(f"  -> {'OK   ' if ok else 'WRONG'}  (max maxdiff={max(diffs):.4f}, "
-          f"run-to-run delta={nondet:.4f})")
+    print(
+        f"  -> {'OK   ' if ok else 'WRONG'}  (max maxdiff={max(diffs):.4f}, "
+        f"run-to-run delta={nondet:.4f})"
+    )
     return ok
 
 
 def main():
     versions()
     torch.manual_seed(1234)
-    weights_cpu = torch.randn(I, H, dtype=torch.float32) * (H ** -0.5)
+    weights_cpu = torch.randn(I, H, dtype=torch.float32) * (H**-0.5)
 
     results = {}
     for seqlen in (64, 128, 256):
@@ -109,8 +120,10 @@ def main():
         print(f"  seqlen={seqlen:<5} [{path}] : {'OK' if ok else 'WRONG  <-- BUG'}")
     print("=" * 70)
     if not all(results.values()):
-        print("REPRODUCED: nki_qkv qkv_cte path (seqlen > "
-              f"{SEQLEN_THRESHOLD_FOR_QKV_CTE}) produces incorrect output.")
+        print(
+            "REPRODUCED: nki_qkv qkv_cte path (seqlen > "
+            f"{SEQLEN_THRESHOLD_FOR_QKV_CTE}) produces incorrect output."
+        )
 
 
 if __name__ == "__main__":
